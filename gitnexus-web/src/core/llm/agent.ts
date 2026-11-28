@@ -459,6 +459,23 @@ export const extractMessageUsage = (rawMessage: unknown): TokenUsage | null => {
   return null;
 };
 
+export const extractRawUsageObject = (rawMessage: unknown): object | null => {
+  if (!rawMessage || typeof rawMessage !== 'object') return null;
+  const msg = rawMessage as Record<string, any>;
+  const candidates = [
+    msg.usage_metadata,
+    msg.response_metadata?.tokenUsage,
+    msg.response_metadata?.usage,
+  ];
+
+  for (const raw of candidates) {
+    if (raw && typeof raw === 'object') {
+      return raw;
+    }
+  }
+  return null;
+};
+
 const isRecursionLimitError = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') return false;
   const err = error as Record<string, any>;
@@ -549,6 +566,7 @@ export async function* streamAgentResponse(
   let budgetAbortController: AbortController | null = null;
   let effectiveSignal = options.signal;
   let budgetExceeded = false;
+  let budgetExceededYielded = false;
   let cleanupAbortListener: (() => void) | null = null;
 
   if (tokenBudget > 0) {
@@ -569,14 +587,25 @@ export async function* streamAgentResponse(
   // 'messages' chunks and 'values' snapshots by message key.
   const usageByMsgKey = new Map<string, TokenUsage>();
   const deltaStreamKeys = new Set<string>();
+  const lastRawUsageByMsgKey = new Map<string, object>();
+  const allModelStepKeys = new Set<string>();
   let cumulativeUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
   const recordUsageForMessage = (
     msgKey: string,
+    rawUsageObj: object | null,
     nextUsage: TokenUsage | null,
     options: { isDelta?: boolean; isSnapshot?: boolean } = {},
   ): boolean => {
     if (!nextUsage) return false;
+    if (!options.isSnapshot && rawUsageObj && typeof rawUsageObj === 'object') {
+      const prevRaw = lastRawUsageByMsgKey.get(msgKey);
+      if (prevRaw && prevRaw === rawUsageObj) {
+        // Carried-over usage metadata reference from prior chunk that omitted usage (e.g. @langchain/google-genai adapter)
+        return false;
+      }
+      lastRawUsageByMsgKey.set(msgKey, rawUsageObj);
+    }
     const prev = usageByMsgKey.get(msgKey);
 
     let isDelta = Boolean(options.isDelta);
@@ -715,6 +744,9 @@ export async function* streamAgentResponse(
 
         // AIMessageChunk - streaming text tokens
         if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
+          const msgKey = msg.id ? String(msg.id) : `anon-ai-${lastProcessedMsgCount}`;
+          allModelStepKeys.add(msgKey);
+
           // If a prior tool completed and remaining budget is zero, halt before another model turn can run
           if (
             tokenBudget > 0 &&
@@ -724,6 +756,7 @@ export async function* streamAgentResponse(
           ) {
             budgetExceeded = true;
             budgetAbortController?.abort();
+            budgetExceededYielded = true;
             yield {
               type: 'budget_exceeded',
               reason: 'token_budget',
@@ -733,16 +766,17 @@ export async function* streamAgentResponse(
             return;
           }
 
-          const msgKey = msg.id ? String(msg.id) : `anon-ai-${lastProcessedMsgCount}`;
+          const rawUsageObj = extractRawUsageObject(msg);
           const msgUsage = extractMessageUsage(msg);
           const isDeltaProvider =
             msg.response_metadata?.model_provider === 'google-genai' ||
             msg.response_metadata?.model_provider === 'google_genai';
-          if (recordUsageForMessage(msgKey, msgUsage, { isDelta: isDeltaProvider })) {
+          if (recordUsageForMessage(msgKey, rawUsageObj, msgUsage, { isDelta: isDeltaProvider })) {
             yield { type: 'usage', usage: cumulativeUsage };
             if (tokenBudget > 0 && cumulativeUsage.totalTokens > tokenBudget) {
               budgetExceeded = true;
               budgetAbortController?.abort();
+              budgetExceededYielded = true;
               yield {
                 type: 'budget_exceeded',
                 reason: 'token_budget',
@@ -827,6 +861,13 @@ export async function* streamAgentResponse(
             yieldedToolResults.add(toolCallId);
             const result =
               typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+
+            const atBudgetLimit = tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget;
+            if (atBudgetLimit) {
+              budgetExceeded = true;
+              budgetAbortController?.abort();
+            }
+
             yield {
               type: 'tool_result',
               toolCall: {
@@ -839,9 +880,8 @@ export async function* streamAgentResponse(
             };
             // After tool result, decrement pending count
             pendingToolCalls = Math.max(0, pendingToolCalls - 1);
-            if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
-              budgetExceeded = true;
-              budgetAbortController?.abort();
+            if (atBudgetLimit) {
+              budgetExceededYielded = true;
               yield {
                 type: 'budget_exceeded',
                 reason: 'token_budget',
@@ -868,12 +908,15 @@ export async function* streamAgentResponse(
 
           if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
             const msgKey = msg.id ? String(msg.id) : `anon-ai-${i}`;
+            allModelStepKeys.add(msgKey);
+            const rawUsageObj = extractRawUsageObject(msg);
             const msgUsage = extractMessageUsage(msg);
-            if (recordUsageForMessage(msgKey, msgUsage, { isSnapshot: true })) {
+            if (recordUsageForMessage(msgKey, rawUsageObj, msgUsage, { isSnapshot: true })) {
               yield { type: 'usage', usage: cumulativeUsage };
               if (tokenBudget > 0 && cumulativeUsage.totalTokens > tokenBudget) {
                 budgetExceeded = true;
                 budgetAbortController?.abort();
+                budgetExceededYielded = true;
                 yield {
                   type: 'budget_exceeded',
                   reason: 'token_budget',
@@ -913,6 +956,13 @@ export async function* streamAgentResponse(
               yieldedToolResults.add(toolCallId);
               const result =
                 typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+
+              const atBudgetLimit = tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget;
+              if (atBudgetLimit) {
+                budgetExceeded = true;
+                budgetAbortController?.abort();
+              }
+
               yield {
                 type: 'tool_result',
                 toolCall: {
@@ -924,9 +974,8 @@ export async function* streamAgentResponse(
                 },
               };
               pendingToolCalls = Math.max(0, pendingToolCalls - 1);
-              if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
-                budgetExceeded = true;
-                budgetAbortController?.abort();
+              if (atBudgetLimit) {
+                budgetExceededYielded = true;
                 yield {
                   type: 'budget_exceeded',
                   reason: 'token_budget',
@@ -949,18 +998,25 @@ export async function* streamAgentResponse(
     }
 
     if (budgetExceeded) {
-      yield {
-        type: 'budget_exceeded',
-        reason: 'token_budget',
-        limit: tokenBudget,
-        usage: cumulativeUsage,
-      };
+      if (!budgetExceededYielded) {
+        budgetExceededYielded = true;
+        yield {
+          type: 'budget_exceeded',
+          reason: 'token_budget',
+          limit: tokenBudget,
+          usage: cumulativeUsage,
+        };
+      }
       return;
     }
 
     debugLog('stream', 'stream completed normally, yielding done');
 
-    const usageUnavailable = tokenBudget > 0 && usageByMsgKey.size === 0;
+    const hasMissingStepUsage =
+      allModelStepKeys.size === 0 ||
+      Array.from(allModelStepKeys).some((key) => !usageByMsgKey.has(key));
+
+    const usageUnavailable = tokenBudget > 0 && hasMissingStepUsage;
 
     yield {
       type: 'done',
@@ -972,17 +1028,24 @@ export async function* streamAgentResponse(
       ...(usageUnavailable ? { usageUnavailable: true } : {}),
     };
   } catch (error) {
-    if (isAbortError(error, options.signal)) {
+    if (options.signal?.aborted) {
       yield { type: 'cancelled' };
       return;
     }
     if (budgetExceeded) {
-      yield {
-        type: 'budget_exceeded',
-        reason: 'token_budget',
-        limit: tokenBudget,
-        usage: cumulativeUsage,
-      };
+      if (!budgetExceededYielded) {
+        budgetExceededYielded = true;
+        yield {
+          type: 'budget_exceeded',
+          reason: 'token_budget',
+          limit: tokenBudget,
+          usage: cumulativeUsage,
+        };
+      }
+      return;
+    }
+    if (isAbortError(error, options.signal)) {
+      yield { type: 'cancelled' };
       return;
     }
     if (isRecursionLimitError(error)) {

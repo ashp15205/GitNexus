@@ -1,4 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import { createReactAgent } from '@langchain/langgraph/prebuilt';
+import { tool } from '@langchain/core/tools';
+import { AIMessage } from '@langchain/core/messages';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { z } from 'zod';
 import {
   streamAgentResponse,
   toRecursionLimit,
@@ -641,6 +647,212 @@ describe('streamAgentResponse limits and token tracking', () => {
         outputTokens: 30,
         totalTokens: 100,
       },
+    });
+  });
+
+  it('pins tool-to-model transition with locked LangGraph 1.7.4 ensuring model is never invoked after budget exhaustion', async () => {
+    class CountingChatModel extends BaseChatModel {
+      _llmType() {
+        return 'counting-model';
+      }
+      modelCallCount = 0;
+      constructor() {
+        super({});
+      }
+      async _generate(_messages: any[], _options?: any) {
+        this.modelCallCount++;
+        if (this.modelCallCount === 1) {
+          return {
+            generations: [
+              {
+                text: '',
+                message: new AIMessage({
+                  content: '',
+                  tool_calls: [{ id: 'call_1', name: 'search_tool', args: { query: 'test' } }],
+                  usage_metadata: { input_tokens: 60, output_tokens: 40, total_tokens: 100 },
+                }),
+              },
+            ],
+          };
+        }
+        return {
+          generations: [
+            {
+              text: 'Unwanted second turn',
+              message: new AIMessage({ content: 'Unwanted second turn' }),
+            },
+          ],
+        };
+      }
+      bindTools() {
+        return this;
+      }
+    }
+
+    const searchTool = tool(async () => 'search results', {
+      name: 'search_tool',
+      description: 'Search tool',
+      schema: z.object({ query: z.string() }),
+    });
+
+    const model = new CountingChatModel();
+    const agent = createReactAgent({ llm: model, tools: [searchTool] });
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      agent,
+      [{ role: 'user', content: 'search something' }],
+      { tokenBudget: 100 },
+    )) {
+      chunks.push(chunk);
+      if (chunk.type === 'tool_result') {
+        // Consumer handles tool result asynchronously while at exact budget limit
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+
+    // Model invocation counter must strictly be 1 — never invoked a second time
+    expect(model.modelCallCount).toBe(1);
+    expect(chunks.some((c) => c.type === 'tool_call')).toBe(true);
+    expect(chunks.some((c) => c.type === 'tool_result')).toBe(true);
+    expect(chunks.some((c) => c.type === 'content' && c.content.includes('Unwanted'))).toBe(false);
+    expect(chunks.at(-1)).toEqual({
+      type: 'budget_exceeded',
+      reason: 'token_budget',
+      limit: 100,
+      usage: {
+        inputTokens: 60,
+        outputTokens: 40,
+        totalTokens: 100,
+      },
+    });
+  });
+
+  it('ignores carried-over usage metadata on metadata-free chunks with locked Google GenAI adapter', async () => {
+    const model = new ChatGoogleGenerativeAI({
+      apiKey: 'test-key',
+      model: 'gemini-1.5-flash',
+    });
+
+    (model as any).client = {
+      generateContentStream: async () => ({
+        stream: (async function* () {
+          // Chunk 1: provider reports usage metadata
+          yield {
+            candidates: [{ content: { role: 'model', parts: [{ text: 'Hello' }] } }],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+          };
+          // Chunk 2: metadata-free streaming text chunk (adapter will carry over chunk 1 usageMetadata)
+          yield {
+            candidates: [{ content: { role: 'model', parts: [{ text: ' world' }] } }],
+          };
+          // Chunk 3: another metadata-free chunk
+          yield {
+            candidates: [{ content: { role: 'model', parts: [{ text: '!' }] } }],
+          };
+        })(),
+      }),
+    };
+
+    const stream = model._streamResponseChunks([], {});
+    const fakeAgent = {
+      stream: vi.fn(async () =>
+        (async function* () {
+          for await (const genChunk of stream) {
+            yield ['messages', [genChunk.message, {}]];
+          }
+        })(),
+      ),
+    } as unknown as MockAgent;
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      fakeAgent,
+      [{ role: 'user', content: 'say hello' }],
+      { tokenBudget: 25 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    // Carried-over metadata was ignored; does not double-count to 45 (which would halt budget at 25)
+    expect(chunks.some((c) => c.type === 'budget_exceeded')).toBe(false);
+    const doneChunk = chunks.find((c) => c.type === 'done');
+    expect(doneChunk).toEqual({
+      type: 'done',
+      historyMessages: undefined,
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+      },
+    });
+  });
+
+  it('flags usageUnavailable while preserving partial usage when one model step reports usage and another omits it', async () => {
+    const fakeAgent = {
+      stream: vi.fn(async () => {
+        return (async function* () {
+          // Step 1: Tool call with usage reported (50 tokens)
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'ai-step-1',
+                content: '',
+                tool_calls: [{ id: 'call-1', name: 'search_code', args: { q: 'auth' } }],
+                usage_metadata: { input_tokens: 30, output_tokens: 20, total_tokens: 50 },
+              }),
+              {},
+            ],
+          ];
+          // Tool executes and emits result
+          yield [
+            'messages',
+            [
+              {
+                _getType: () => 'tool',
+                tool_call_id: 'call-1',
+                name: 'search_code',
+                content: 'result',
+              },
+              {},
+            ],
+          ];
+          // Step 2: Final answer with usage omitted (provider didn't return usage)
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'ai-step-2',
+                content: 'Here is the summary of auth.',
+                usage_metadata: undefined,
+              }),
+              {},
+            ],
+          ];
+        })();
+      }),
+    } as unknown as MockAgent;
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      fakeAgent,
+      [{ role: 'user', content: 'search and summarize' }],
+      { tokenBudget: 200 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    const doneChunk = chunks.find((c) => c.type === 'done');
+    expect(doneChunk).toEqual({
+      type: 'done',
+      historyMessages: undefined,
+      usage: {
+        inputTokens: 30,
+        outputTokens: 20,
+        totalTokens: 50,
+      },
+      usageUnavailable: true,
     });
   });
 });
