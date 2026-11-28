@@ -60,7 +60,7 @@ export const RightPanel = () => {
         if (msg.estimatedCostUsd === 0) {
           acc.hasLocalCost = true;
         }
-      } else if (msg.tokenUsage && msg.tokenUsage.totalTokens > 0) {
+      } else if (msg.role === 'assistant' || (msg.tokenUsage && msg.tokenUsage.totalTokens > 0)) {
         acc.hasUnknownCost = true;
       }
       return acc;

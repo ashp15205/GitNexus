@@ -573,18 +573,67 @@ export async function* streamAgentResponse(
   // Track cumulative token usage across agent LLM steps, deduplicating across
   // 'messages' chunks and 'values' snapshots by message key.
   const usageByMsgKey = new Map<string, TokenUsage>();
+  const deltaStreamKeys = new Set<string>();
   let cumulativeUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
-  const recordUsageForMessage = (msgKey: string, nextUsage: TokenUsage | null): boolean => {
+  const recordUsageForMessage = (
+    msgKey: string,
+    nextUsage: TokenUsage | null,
+    options: { isDelta?: boolean; isSnapshot?: boolean } = {},
+  ): boolean => {
     if (!nextUsage) return false;
     const prev = usageByMsgKey.get(msgKey);
-    const inputTokens = Math.max(prev?.inputTokens ?? 0, nextUsage.inputTokens);
-    const outputTokens = Math.max(prev?.outputTokens ?? 0, nextUsage.outputTokens);
-    const totalTokens = Math.max(
-      prev?.totalTokens ?? 0,
-      nextUsage.totalTokens,
-      inputTokens + outputTokens,
-    );
+
+    let isDelta = Boolean(options.isDelta);
+    if (!options.isSnapshot && !isDelta && prev) {
+      // Auto-detect incremental deltas (e.g. Gemini chunks or providers emitting token deltas).
+      // If output tokens arrive with inputTokens=0 when prompt tokens were already established,
+      // or totalTokens is less than previously observed totalTokens, this stream emits deltas.
+      if (
+        (prev.inputTokens > 0 && nextUsage.inputTokens === 0 && nextUsage.outputTokens > 0) ||
+        nextUsage.totalTokens < prev.totalTokens
+      ) {
+        isDelta = true;
+      }
+    }
+
+    if (isDelta) {
+      deltaStreamKeys.add(msgKey);
+    }
+
+    let inputTokens: number;
+    let outputTokens: number;
+    let totalTokens: number;
+
+    if (options.isSnapshot) {
+      // Reconcile once with final aggregate usage snapshot from 'values' mode
+      inputTokens = Math.max(prev?.inputTokens ?? 0, nextUsage.inputTokens);
+      outputTokens = Math.max(prev?.outputTokens ?? 0, nextUsage.outputTokens);
+      totalTokens = Math.max(
+        prev?.totalTokens ?? 0,
+        nextUsage.totalTokens,
+        inputTokens + outputTokens,
+      );
+    } else if (deltaStreamKeys.has(msgKey)) {
+      // Accumulate deltas for streaming chunks (e.g. Gemini provider adapter)
+      inputTokens = (prev?.inputTokens ?? 0) + nextUsage.inputTokens;
+      outputTokens = (prev?.outputTokens ?? 0) + nextUsage.outputTokens;
+      totalTokens = Math.max(
+        inputTokens + outputTokens,
+        (prev?.totalTokens ?? 0) +
+          (nextUsage.totalTokens || nextUsage.inputTokens + nextUsage.outputTokens),
+      );
+    } else {
+      // Cumulative snapshot chunks (e.g. providers that emit running totals in each chunk)
+      inputTokens = Math.max(prev?.inputTokens ?? 0, nextUsage.inputTokens);
+      outputTokens = Math.max(prev?.outputTokens ?? 0, nextUsage.outputTokens);
+      totalTokens = Math.max(
+        prev?.totalTokens ?? 0,
+        nextUsage.totalTokens,
+        inputTokens + outputTokens,
+      );
+    }
+
     if (
       prev &&
       prev.inputTokens === inputTokens &&
@@ -668,11 +717,27 @@ export async function* streamAgentResponse(
 
         // AIMessageChunk - streaming text tokens
         if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
+          // If previous turn already exhausted budget (remaining budget is 0), halt before model work
+          if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
+            budgetExceeded = true;
+            budgetAbortController?.abort();
+            yield {
+              type: 'budget_exceeded',
+              reason: 'token_budget',
+              limit: tokenBudget,
+              usage: cumulativeUsage,
+            };
+            return;
+          }
+
           const msgKey = msg.id ? String(msg.id) : `anon-ai-${lastProcessedMsgCount}`;
           const msgUsage = extractMessageUsage(msg);
-          if (recordUsageForMessage(msgKey, msgUsage)) {
+          const isDeltaProvider =
+            msg.response_metadata?.model_provider === 'google-genai' ||
+            msg.response_metadata?.model_provider === 'google_genai';
+          if (recordUsageForMessage(msgKey, msgUsage, { isDelta: isDeltaProvider })) {
             yield { type: 'usage', usage: cumulativeUsage };
-            if (tokenBudget > 0 && cumulativeUsage.totalTokens > tokenBudget) {
+            if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
               budgetExceeded = true;
               budgetAbortController?.abort();
               yield {
@@ -771,6 +836,17 @@ export async function* streamAgentResponse(
             };
             // After tool result, decrement pending count
             pendingToolCalls = Math.max(0, pendingToolCalls - 1);
+            if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
+              budgetExceeded = true;
+              budgetAbortController?.abort();
+              yield {
+                type: 'budget_exceeded',
+                reason: 'token_budget',
+                limit: tokenBudget,
+                usage: cumulativeUsage,
+              };
+              return;
+            }
           }
         }
       }
@@ -790,9 +866,9 @@ export async function* streamAgentResponse(
           if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
             const msgKey = msg.id ? String(msg.id) : `anon-ai-${i}`;
             const msgUsage = extractMessageUsage(msg);
-            if (recordUsageForMessage(msgKey, msgUsage)) {
+            if (recordUsageForMessage(msgKey, msgUsage, { isSnapshot: true })) {
               yield { type: 'usage', usage: cumulativeUsage };
-              if (tokenBudget > 0 && cumulativeUsage.totalTokens > tokenBudget) {
+              if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
                 budgetExceeded = true;
                 budgetAbortController?.abort();
                 yield {
@@ -845,6 +921,17 @@ export async function* streamAgentResponse(
                 },
               };
               pendingToolCalls = Math.max(0, pendingToolCalls - 1);
+              if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
+                budgetExceeded = true;
+                budgetAbortController?.abort();
+                yield {
+                  type: 'budget_exceeded',
+                  reason: 'token_budget',
+                  limit: tokenBudget,
+                  usage: cumulativeUsage,
+                };
+                return;
+              }
             }
           }
         }

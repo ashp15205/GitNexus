@@ -129,4 +129,30 @@ describe('RightPanel token usage and cost display', () => {
     expect(conversationBadge.textContent).not.toContain('chat:usage.localCost');
     expect(conversationBadge.textContent).not.toContain('$0.00');
   });
+
+  it('does not label conversation as Local (free) when cloud assistant turn has no usage metadata', () => {
+    mockChatMessages = [
+      {
+        id: 'assistant-local',
+        role: 'assistant',
+        content: 'Local answer',
+        tokenUsage: { inputTokens: 400, outputTokens: 100, totalTokens: 500 },
+        estimatedCostUsd: 0,
+        timestamp: 1002,
+      },
+      {
+        id: 'assistant-usage-free-cloud',
+        role: 'assistant',
+        content: 'Cloud answer with missing/free usage metadata',
+        estimatedCostUsd: null,
+        timestamp: 1003,
+      },
+    ];
+
+    render(<RightPanel />);
+
+    const conversationBadge = screen.getByTestId('conversation-token-usage');
+    expect(conversationBadge.textContent).not.toContain('chat:usage.localCost');
+    expect(conversationBadge.textContent).not.toContain('$0.00');
+  });
 });

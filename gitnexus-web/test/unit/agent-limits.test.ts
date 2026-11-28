@@ -362,4 +362,217 @@ describe('streamAgentResponse limits and token tracking', () => {
       { type: 'done', historyMessages: undefined, usageUnavailable: true },
     ]);
   });
+
+  it('accumulates incremental deltas for Gemini streams and halts when budget is reached', async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const fakeAgent = {
+      stream: vi.fn(async (_input: unknown, config: { signal?: AbortSignal }) => {
+        capturedSignal = config.signal;
+        return (async function* () {
+          // Chunk 1: Initial prompt tokens + first candidate tokens
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'gemini-turn-1',
+                content: 'Step 1',
+                response_metadata: { model_provider: 'google-genai' },
+                usage_metadata: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+              }),
+              {},
+            ],
+          ];
+          // Chunk 2: Incremental delta (5 new candidate tokens) -> total should be 115
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'gemini-turn-1',
+                content: 'Step 2',
+                response_metadata: { model_provider: 'google-genai' },
+                usage_metadata: { input_tokens: 0, output_tokens: 5, total_tokens: 5 },
+              }),
+              {},
+            ],
+          ];
+          // Chunk 3: Should not be processed because budget is 115
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'gemini-turn-1',
+                content: 'Step 3',
+                response_metadata: { model_provider: 'google-genai' },
+                usage_metadata: { input_tokens: 0, output_tokens: 10, total_tokens: 10 },
+              }),
+              {},
+            ],
+          ];
+        })();
+      }),
+    } as unknown as MockAgent;
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      fakeAgent,
+      [{ role: 'user', content: 'run query' }],
+      { tokenBudget: 115 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(chunks.at(-1)).toEqual({
+      type: 'budget_exceeded',
+      reason: 'token_budget',
+      limit: 115,
+      usage: {
+        inputTokens: 100,
+        outputTokens: 15,
+        totalTokens: 115,
+      },
+    });
+  });
+
+  it('accumulates Gemini deltas and reconciles once with final values snapshot without double counting', async () => {
+    const fakeAgent = {
+      stream: vi.fn(async () => {
+        return (async function* () {
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'gemini-turn-1',
+                content: 'Thinking',
+                response_metadata: { model_provider: 'google-genai' },
+                usage_metadata: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+              }),
+              {},
+            ],
+          ];
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'gemini-turn-1',
+                content: ' more',
+                response_metadata: { model_provider: 'google-genai' },
+                usage_metadata: { input_tokens: 0, output_tokens: 15, total_tokens: 15 },
+              }),
+              {},
+            ],
+          ];
+          // Final values mode snapshot with aggregate usage (100 + 25 = 125)
+          yield [
+            'values',
+            {
+              messages: [
+                { _getType: () => 'human', content: 'run query' },
+                makeAiChunk({
+                  id: 'gemini-turn-1',
+                  content: 'Thinking more',
+                  response_metadata: { model_provider: 'google-genai' },
+                  usage_metadata: { input_tokens: 100, output_tokens: 25, total_tokens: 125 },
+                }),
+              ],
+            },
+          ];
+        })();
+      }),
+    } as unknown as MockAgent;
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      fakeAgent,
+      [{ role: 'user', content: 'run query' }],
+      { tokenBudget: 200 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    const doneChunk = chunks.find((c) => c.type === 'done');
+    expect(doneChunk).toEqual({
+      type: 'done',
+      historyMessages: undefined,
+      usage: {
+        inputTokens: 100,
+        outputTokens: 25,
+        totalTokens: 125,
+      },
+    });
+  });
+
+  it('halts at exact equality on tool-to-model transition when remaining budget is zero', async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const fakeAgent = {
+      stream: vi.fn(async (_input: unknown, config: { signal?: AbortSignal }) => {
+        capturedSignal = config.signal;
+        return (async function* () {
+          // Model turn 1: emits a tool call and exhausts budget exactly (100 / 100 tokens)
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'ai-turn-1',
+                content: '',
+                tool_calls: [{ id: 'call-1', name: 'search_code', args: { q: 'auth' } }],
+                usage_metadata: { input_tokens: 70, output_tokens: 30, total_tokens: 100 },
+              }),
+              {},
+            ],
+          ];
+          // Tool executes and emits result
+          yield [
+            'messages',
+            [
+              {
+                _getType: () => 'tool',
+                tool_call_id: 'call-1',
+                name: 'search_code',
+                content: 'result',
+              },
+              {},
+            ],
+          ];
+          // Subsequent model turn that should NOT execute
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'ai-turn-2',
+                content: 'Continuing with remaining budget 0...',
+                usage_metadata: { input_tokens: 20, output_tokens: 10, total_tokens: 30 },
+              }),
+              {},
+            ],
+          ];
+        })();
+      }),
+    } as unknown as MockAgent;
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      fakeAgent,
+      [{ role: 'user', content: 'search and summarize' }],
+      { tokenBudget: 100 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    expect(capturedSignal?.aborted).toBe(true);
+    // Verified that it yields budget_exceeded at exact equality and does not process ai-turn-2
+    expect(chunks.some((c) => c.type === 'reasoning' && c.reasoning.includes('Continuing'))).toBe(
+      false,
+    );
+    expect(chunks.at(-1)).toEqual({
+      type: 'budget_exceeded',
+      reason: 'token_budget',
+      limit: 100,
+      usage: {
+        inputTokens: 70,
+        outputTokens: 30,
+        totalTokens: 100,
+      },
+    });
+  });
 });
