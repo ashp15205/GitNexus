@@ -13,6 +13,25 @@ entries. The count arm remains 138 call drops and 168 total drops.
 Earlier entries below retain their original measurement contracts and source pins;
 member-name-only RESOLVES claims in those entries are historical.
 
+## C# array-typed parameters (#4098)
+
+C# `indexElement` (`repos[0].Save()` with a `User[] repos` parameter) moves
+VISIBLE-GAP -> RESOLVES with the exact `User.Save` target. The C# query now
+captures `(array_type)` parameter types, so `repos` binds `User[]`, and the
+existing `elementTypeOf` index route peels it to `User`. Every other shape
+state is unchanged, and the count arm is unchanged.
+
+The capture is limited to scoped owners (method, constructor, local function,
+operator, conversion operator) and to identifier or predefined-type elements.
+Generic elements (`Box<User>[]`, `Cell<User>[,]`) and unscoped owners
+(delegate, indexer, anonymous method, lambda) would otherwise produce
+wrong-owner edges; `csharp-array-parameter-binding.test.ts` pins them as
+no-target rows.
+
+The same change moves `bench/scope-capture`: the C# fingerprint goes from
+`3720a3d2` (2899 groups) to `38c6dc76` (2901 groups), the two `string[] args`
+parameters of `Main`. Both `measure.mjs --check` runs pass.
+
 ## Java receiver and generated dependency ownership (#3955)
 
 Java `indexElement` (`repos[0].save()` with a `User[] repos` parameter) moves
@@ -1560,3 +1579,11 @@ no in-repository target. The fixture's three existing call edges are preserved.
 This increases the all-language count from 174 to 176 unresolved calls, with
 34 unresolved reads. The dynamic-import fixture still links `feature.activate()`
 to its imported `Feature.activate` method.
+
+### TypeScript private-field fixture migration
+
+The former `ts-private-members/store.ts` fixture contributed one unresolved
+call to `this.#items.push(item)` in `Store.add`. Removing that duplicate from
+the benchmark corpus reduced TypeScript call drops from 21 to 20 and total
+call drops from 177 to 176. Both resolver versions reported the same 20
+TypeScript sites when run on the updated corpus.

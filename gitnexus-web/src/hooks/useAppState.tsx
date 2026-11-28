@@ -34,6 +34,7 @@ import {
   connectToServer,
   runQuery as backendRunQuery,
   search as backendSearch,
+  searchWithMetadata as backendSearchWithMetadata,
   grep as backendGrep,
   readFile as backendReadFile,
   startEmbeddings as backendStartEmbeddings,
@@ -46,11 +47,13 @@ import {
   type ConnectResult,
   type GrepOptions,
   type JobProgress,
+  type SearchOptions,
 } from '../services/backend-client';
 import { ERROR_RESET_DELAY_MS } from '../config/ui-constants';
 import i18n from '../i18n';
 import { normalizePath, resolveUniqueIndexedPath } from '../lib/path-resolution';
 import { FILE_REF_REGEX, NODE_REF_REGEX } from '../lib/grounding-patterns';
+import { debugLog } from '../lib/debug';
 import { GraphStateProvider, useGraphState, type GraphMode } from './app-state/graph';
 
 export const AUTO_START_EMBEDDINGS_STORAGE_KEY = 'gitnexus.autoStartEmbeddings';
@@ -682,7 +685,8 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
         const backend = {
           executeQuery,
-          search: (query: string, opts?: any) => backendSearch(query, { ...opts, repo }),
+          search: (query: string, opts?: SearchOptions) =>
+            backendSearchWithMetadata(query, { ...opts, repo }),
           grep: (pattern: string, limit?: number, opts?: GrepOptions) =>
             backendGrep(pattern, repo, limit, opts),
           readFile: (filePath: string) =>
@@ -692,9 +696,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         agentRef.current = createGraphRAGAgent(config, backend, codebaseContext, chatOnly);
         setIsAgentReady(true);
         setAgentError(null);
-        if (import.meta.env.DEV) {
-          console.log('✅ Agent initialized successfully');
-        }
+        debugLog('agent', 'agent initialized successfully');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setAgentError(message);

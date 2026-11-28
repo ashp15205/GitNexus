@@ -395,13 +395,26 @@ describe('streamAgentResponse limits and token tracking', () => {
               {},
             ],
           ];
-          // Chunk 3: Should not be processed because budget is 115
+          // Chunk 3: Incremental delta (10 new candidate tokens) -> total becomes 125, exceeding 115 budget
           yield [
             'messages',
             [
               makeAiChunk({
                 id: 'gemini-turn-1',
                 content: 'Step 3',
+                response_metadata: { model_provider: 'google-genai' },
+                usage_metadata: { input_tokens: 0, output_tokens: 10, total_tokens: 10 },
+              }),
+              {},
+            ],
+          ];
+          // Chunk 4: Should not be processed because budget was exceeded on chunk 3
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'gemini-turn-1',
+                content: 'Step 4',
                 response_metadata: { model_provider: 'google-genai' },
                 usage_metadata: { input_tokens: 0, output_tokens: 10, total_tokens: 10 },
               }),
@@ -422,14 +435,17 @@ describe('streamAgentResponse limits and token tracking', () => {
     }
 
     expect(capturedSignal?.aborted).toBe(true);
+    expect(chunks.some((c) => c.type === 'reasoning' && c.reasoning.includes('Step 4'))).toBe(
+      false,
+    );
     expect(chunks.at(-1)).toEqual({
       type: 'budget_exceeded',
       reason: 'token_budget',
       limit: 115,
       usage: {
         inputTokens: 100,
-        outputTokens: 15,
-        totalTokens: 115,
+        outputTokens: 25,
+        totalTokens: 125,
       },
     });
   });
@@ -560,6 +576,9 @@ describe('streamAgentResponse limits and token tracking', () => {
     }
 
     expect(capturedSignal?.aborted).toBe(true);
+    // Verified that tool call and tool result are processed before transition halts
+    expect(chunks.some((c) => c.type === 'tool_call')).toBe(true);
+    expect(chunks.some((c) => c.type === 'tool_result')).toBe(true);
     // Verified that it yields budget_exceeded at exact equality and does not process ai-turn-2
     expect(chunks.some((c) => c.type === 'reasoning' && c.reasoning.includes('Continuing'))).toBe(
       false,
@@ -568,6 +587,55 @@ describe('streamAgentResponse limits and token tracking', () => {
       type: 'budget_exceeded',
       reason: 'token_budget',
       limit: 100,
+      usage: {
+        inputTokens: 70,
+        outputTokens: 30,
+        totalTokens: 100,
+      },
+    });
+  });
+
+  it('does not discard final AI chunk content when usage lands exactly on the budget limit', async () => {
+    const fakeAgent = {
+      stream: vi.fn(async () => {
+        return (async function* () {
+          yield [
+            'messages',
+            [
+              makeAiChunk({
+                id: 'ai-turn-final',
+                content: '42 is the answer.',
+                usage_metadata: { input_tokens: 70, output_tokens: 30, total_tokens: 100 },
+              }),
+              {},
+            ],
+          ];
+        })();
+      }),
+    } as unknown as MockAgent;
+
+    const chunks: AgentStreamChunk[] = [];
+    for await (const chunk of streamAgentResponse(
+      fakeAgent,
+      [{ role: 'user', content: 'what is the answer?' }],
+      { tokenBudget: 100 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    // Verify chunk content was yielded rather than discarded
+    expect(
+      chunks.some(
+        (c) =>
+          c.type === 'content' ||
+          (c.type === 'reasoning' && c.reasoning.includes('42 is the answer.')),
+      ),
+    ).toBe(true);
+    // Completes normally with done rather than budget_exceeded because budget was met, not exceeded
+    const doneChunk = chunks.find((c) => c.type === 'done');
+    expect(doneChunk).toEqual({
+      type: 'done',
+      historyMessages: undefined,
       usage: {
         inputTokens: 70,
         outputTokens: 30,

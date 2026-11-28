@@ -49,6 +49,7 @@ import {
   normalizeMessageContent,
   normalizeToolCalls,
 } from './deepseek-chat-model';
+import { debugLog } from '../../lib/debug';
 
 /**
  * System prompt for the Graph RAG agent
@@ -246,14 +247,11 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
     case 'openrouter': {
       const openRouterConfig = config as OpenRouterConfig;
 
-      // Debug logging
-      if (import.meta.env.DEV) {
-        console.log('🌐 OpenRouter config:', {
-          hasApiKey: !!openRouterConfig.apiKey,
-          model: openRouterConfig.model,
-          baseUrl: openRouterConfig.baseUrl,
-        });
-      }
+      debugLog('llm', 'OpenRouter config:', {
+        hasApiKey: !!openRouterConfig.apiKey,
+        model: openRouterConfig.model,
+        baseUrl: openRouterConfig.baseUrl,
+      });
 
       if (!openRouterConfig.apiKey || openRouterConfig.apiKey.trim() === '') {
         throw new Error('OpenRouter API key is required but was not provided');
@@ -395,10 +393,7 @@ export const createGraphRAGAgent = (
       ? `${BASE_SYSTEM_PROMPT}${CHAT_ONLY_PROMPT_NOTE}`
       : BASE_SYSTEM_PROMPT;
 
-  // Log the full prompt for debugging
-  if (import.meta.env.DEV) {
-    console.log('🤖 AGENT SYSTEM PROMPT:\n', systemPrompt);
-  }
+  debugLog('agent', 'system prompt:\n', systemPrompt);
 
   const agent = createReactAgent({
     llm: model as any,
@@ -701,12 +696,15 @@ export async function* streamAgentResponse(
         data = event;
       }
 
-      // DEBUG: Enhanced logging
+      // Kept behind the DEV check so production skips the per-event field reads.
       if (import.meta.env.DEV) {
         const msgType = (mode === 'messages' && data?.[0]?._getType?.()) || 'n/a';
         const hasContent = mode === 'messages' && data?.[0]?.content;
         const hasToolCalls = mode === 'messages' && data?.[0]?.tool_calls?.length > 0;
-        console.log(`🔄 [${mode}] type:${msgType} content:${!!hasContent} tools:${hasToolCalls}`);
+        debugLog(
+          'stream',
+          `[${mode}] type:${msgType} content:${!!hasContent} tools:${hasToolCalls}`,
+        );
       }
       // Handle 'messages' mode - token-by-token streaming
       if (mode === 'messages') {
@@ -717,8 +715,13 @@ export async function* streamAgentResponse(
 
         // AIMessageChunk - streaming text tokens
         if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
-          // If previous turn already exhausted budget (remaining budget is 0), halt before model work
-          if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
+          // If a prior tool completed and remaining budget is zero, halt before another model turn can run
+          if (
+            tokenBudget > 0 &&
+            cumulativeUsage.totalTokens >= tokenBudget &&
+            hasSeenToolCallThisTurn &&
+            pendingToolCalls === 0
+          ) {
             budgetExceeded = true;
             budgetAbortController?.abort();
             yield {
@@ -737,7 +740,7 @@ export async function* streamAgentResponse(
             msg.response_metadata?.model_provider === 'google_genai';
           if (recordUsageForMessage(msgKey, msgUsage, { isDelta: isDeltaProvider })) {
             yield { type: 'usage', usage: cumulativeUsage };
-            if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
+            if (tokenBudget > 0 && cumulativeUsage.totalTokens > tokenBudget) {
               budgetExceeded = true;
               budgetAbortController?.abort();
               yield {
@@ -868,7 +871,7 @@ export async function* streamAgentResponse(
             const msgUsage = extractMessageUsage(msg);
             if (recordUsageForMessage(msgKey, msgUsage, { isSnapshot: true })) {
               yield { type: 'usage', usage: cumulativeUsage };
-              if (tokenBudget > 0 && cumulativeUsage.totalTokens >= tokenBudget) {
+              if (tokenBudget > 0 && cumulativeUsage.totalTokens > tokenBudget) {
                 budgetExceeded = true;
                 budgetAbortController?.abort();
                 yield {
@@ -955,10 +958,7 @@ export async function* streamAgentResponse(
       return;
     }
 
-    // DEBUG: Stream completed normally
-    if (import.meta.env.DEV) {
-      console.log('✅ Stream completed normally, yielding done');
-    }
+    debugLog('stream', 'stream completed normally, yielding done');
 
     const usageUnavailable = tokenBudget > 0 && usageByMsgKey.size === 0;
 
